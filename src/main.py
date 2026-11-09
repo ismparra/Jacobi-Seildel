@@ -4,12 +4,11 @@ El usuario captura fuentes y resistencias; se genera el sistema A·I = V
 (ley de voltajes de Kirchhoff) y se resuelve con Jacobi y/o Gauss-Seidel.
 """
 
-import re
-import time
-import tkinter as tk
 from tkinter import ttk
 
 import customtkinter as ctk
+
+import solve
 
 # Paleta Kirchhoff: azul de plano eléctrico, ámbar (corriente) y cian (voltaje)
 COLOR_JACOBI = "#F2A900"
@@ -31,73 +30,6 @@ for _w, _k in [("CTk", {"fg_color": BG}), ("CTkFrame", {"fg_color": PANEL, "top_
                ("CTkSwitch", {"progress_color": ACCENT}),
                ("CTkEntry", {"border_color": ("#7FA1C2", "#2A4A6B"), "fg_color": ("#FFFFFF", "#0A1724")})]:
     ctk.ThemeManager.theme[_w].update({a: list(b) if isinstance(b, tuple) else b for a, b in _k.items()})
-
-# Si se pasa de este valor se considera que las iteraciones se alejan de la solución
-LIMITE_DIVERGENCIA = 1e12
-
-
-# ------------------------------------------------------------------ lógica
-def parsear_suma(texto):
-    """'4 + 3, 2' -> 9.0 (resistencias propias de una malla)."""
-    partes = [p for p in re.split(r"[,+]", texto) if p.strip()]
-    return sum(float(p) for p in partes)
-
-
-def generar_sistema(fuentes, propias, compartidas):
-    """Mallas: R_ii·I_i − Σ R_ij·I_j = V_i. compartidas = [(a, b, R)] con a,b base 0."""
-    n = len(fuentes)
-    A = [[0.0] * n for _ in range(n)]
-    for i in range(n):
-        A[i][i] = propias[i]
-    for a, b, r in compartidas:
-        A[a][a] += r
-        A[b][b] += r
-        A[a][b] -= r
-        A[b][a] -= r
-    return A, list(fuentes)
-
-
-def ecuaciones_texto(A, b):
-    eqs = []
-    for i, fila in enumerate(A):
-        t = ""
-        for j, a in enumerate(fila):
-            if a == 0:
-                continue
-            t += f" {'-' if a < 0 else '+'} " if t else ("-" if a < 0 else "")
-            t += f"{abs(a):g}·I{j + 1}"
-        eqs.append(f"Malla {i + 1}:  {t or '0'} = {b[i]:g}")
-    return eqs
-
-
-def es_diagonal_dominante(A):
-    return all(abs(A[i][i]) >= sum(abs(a) for j, a in enumerate(A[i]) if j != i) for i in range(len(A)))
-
-
-def iterar(A, b, x0, tol, max_iter, gauss_seidel):
-    """Devuelve (historial[(k, x, err%)], convergió, tiempo_ms, motivo)."""
-    n = len(b)
-    x = list(x0)
-    hist, motivo, conv = [], "No alcanzó el error permitido en el máximo de iteraciones", False
-    t0 = time.perf_counter()
-    for k in range(1, max_iter + 1):
-        prev = list(x)
-        nuevo = x if gauss_seidel else [0.0] * n  # Seidel sobrescribe x; Jacobi lee solo prev
-        for i in range(n):
-            s = sum(A[i][j] * (nuevo if gauss_seidel else prev)[j] for j in range(n) if j != i)
-            nuevo[i] = (b[i] - s) / A[i][i]
-        x = nuevo
-        err = max(abs(x[i] - prev[i]) / abs(x[i]) * 100 if x[i] else abs(x[i] - prev[i]) * 100
-                  for i in range(n))
-        hist.append((k, list(x), err))
-        if err > LIMITE_DIVERGENCIA or err != err:
-            motivo = "Las iteraciones se alejan de la solución (diverge)"
-            break
-        if err < tol:
-            conv, motivo = True, "Convergió"
-            break
-    return hist, conv, (time.perf_counter() - t0) * 1000, motivo
-
 
 class App(ctk.CTk):
     def __init__(self):
@@ -213,6 +145,12 @@ class App(ctk.CTk):
         self.shared_frame = ctk.CTkFrame(panel, fg_color="transparent")
         self.shared_frame.pack(fill="x", padx=8, pady=(0, 6))
         self.shared_frame.grid_columnconfigure((0, 1, 2), weight=1)
+        head = ctk.CTkFrame(self.shared_frame, fg_color="transparent")
+        head.pack(fill="x")
+        head.grid_columnconfigure((0, 1, 2), weight=1, uniform="c")
+        for c, t in enumerate(("Malla a", "Malla b", "R (Ω)")):
+            ctk.CTkLabel(head, text=t, text_color="gray60", anchor="w").grid(
+                row=0, column=c, sticky="w", padx=(0 if c == 0 else 6, 0))
 
         tools = ctk.CTkFrame(panel, fg_color="transparent")
         tools.pack(fill="x", padx=8, pady=(0, 14))
@@ -456,7 +394,7 @@ class App(ctk.CTk):
     def agregar_compartida(self, a="", b="", r=""):
         frame = ctk.CTkFrame(self.shared_frame, fg_color="transparent")
         frame.pack(fill="x")
-        frame.grid_columnconfigure((0, 1, 2), weight=1)
+        frame.grid_columnconfigure((0, 1, 2), weight=1, uniform="c")
         ents = []
         for c, ph in enumerate(("Malla a", "Malla b", "R (Ω)")):
             e = ctk.CTkEntry(frame, placeholder_text=ph)
@@ -506,47 +444,26 @@ class App(ctk.CTk):
         self.ocultar_alerta()
         self._set_status("Campos limpiados")
 
-    def _leer_datos(self):
-        """Valida la captura; lanza ValueError con un mensaje para el usuario."""
-        n = len(self.mesh_rows)
-        if n < 2:
-            raise ValueError("Agregue al menos 2 mallas.")
-        try:
-            fuentes = [float(ev.get()) for _, ev, _ in self.mesh_rows]
-            propias = [parsear_suma(er.get()) for _, _, er in self.mesh_rows]
-            comp = []
-            for _, ea, eb, er in self.shared_rows:
-                a, b, r = int(ea.get()) - 1, int(eb.get()) - 1, float(er.get())
-                if a == b or not (0 <= a < n and 0 <= b < n):
-                    raise ValueError(f"Resistencia compartida inválida: mallas {a + 1} y {b + 1}.")
-                comp.append((a, b, r))
-            tol = float(self.error_entry.get() or 0.001)
-            max_iter = int(self.max_iter_entry.get() or 100)
-            x0 = [float(t) for t in self.x0_entry.get().split(",")] if self.x0_entry.get().strip() else [0.0] * n
-        except ValueError as e:
-            raise ValueError(str(e) if "inválida" in str(e) else "Hay valores no numéricos o vacíos en los datos.")
-        if len(x0) != n:
-            raise ValueError(f"La aproximación inicial debe tener {n} valores (uno por malla).")
-        if any(r <= 0 for r in propias) and not comp or any(r < 0 for _, _, r in comp) or tol <= 0 or max_iter < 1:
-            raise ValueError("Resistencias ≥ 0, error > 0 e iteraciones ≥ 1.")
-        return fuentes, propias, comp, tol, max_iter, x0
-
     def resolver(self):
         self.ocultar_alerta()
         try:
-            fuentes, propias, comp, tol, max_iter, x0 = self._leer_datos()
+            fuentes, propias, comp, tol, max_iter, x0 = solve.leer_datos(
+                [(ev.get(), er.get()) for _, ev, er in self.mesh_rows],
+                [(ea.get(), eb.get(), er.get()) for _, ea, eb, er in self.shared_rows],
+                self.error_entry.get(), self.max_iter_entry.get(), self.x0_entry.get(),
+            )
         except ValueError as e:
             self.mostrar_alerta(f"⚠ {e}", COLOR_ERROR)
             self._set_status("Datos inválidos")
             return
-        A, b = generar_sistema(fuentes, propias, comp)
+        A, b = solve.generar_sistema(fuentes, propias, comp)
         if any(A[i][i] == 0 for i in range(len(b))):
             self.mostrar_alerta("⚠ Una malla tiene resistencia total 0 Ω: el sistema no se puede resolver.", COLOR_ERROR)
             return
 
-        dom = es_diagonal_dominante(A)
+        dom = solve.es_diagonal_dominante(A)
         lineas = ["Ley de voltajes de Kirchhoff (corrientes de malla, sentido horario):", ""]
-        lineas += ecuaciones_texto(A, b)
+        lineas += solve.ecuaciones_texto(A, b)
         lineas += ["", "Forma matricial  A·I = V:", ""]
         lineas += ["  [ " + "  ".join(f"{a:8.3g}" for a in fila) + f" ]   [ I{i + 1} ] = [ {b[i]:g} ]"
                    for i, fila in enumerate(A)]
@@ -554,18 +471,16 @@ class App(ctk.CTk):
                                                           else "no (puede o no converger)")]
         self._escribir(self.system_box, "\n".join(lineas))
 
-        metodo = self.metodo_var.get()
-        corridas = {}
-        for nombre, gs, tree, card in (("Jacobi", False, self.jacobi_tree, self.jacobi_card),
-                                       ("Gauss-Seidel", True, self.seidel_tree, self.seidel_card)):
+        corridas = solve.ejecutar(self.metodo_var.get(), A, b, x0, tol, max_iter)
+        for nombre, tree, card in (("Jacobi", self.jacobi_tree, self.jacobi_card),
+                                   ("Gauss-Seidel", self.seidel_tree, self.seidel_card)):
             tree.delete(*tree.get_children())
-            if metodo not in (nombre, "Ambos"):
+            if nombre not in corridas:
                 for k in ("estado", "iter", "tiempo", "error"):
                     card[k].configure(text="—")
                 self._escribir(card["solucion"], "")
                 continue
-            hist, conv, ms, motivo = iterar(A, b, x0, tol, max_iter, gs)
-            corridas[nombre] = (hist, conv, ms)
+            hist, conv, ms, _ = corridas[nombre]
             for k, x, err in hist:
                 tree.insert("", "end", values=(k, ",  ".join(f"I{i + 1}={v:.6f}" for i, v in enumerate(x)),
                                                f"{err:.6f}"))
@@ -576,25 +491,15 @@ class App(ctk.CTk):
             self._escribir(card["solucion"], "\n".join(f"I{i + 1} = {v:.6f} A" for i, v in enumerate(hist[-1][1])))
 
         self.compare_tree.delete(*self.compare_tree.get_children())
-        for nombre, (hist, conv, ms) in corridas.items():
+        for nombre, (hist, conv, ms, _) in corridas.items():
             self.compare_tree.insert("", "end", values=(nombre, len(hist), f"{ms:.3f}", f"{hist[-1][2]:.6g}",
                                                         "Sí" if conv else "No"))
-        fallos = [n for n, (_, c, _) in corridas.items() if not c]
+        fallos = [n for n, r in corridas.items() if not r[1]]
         if fallos:
             self.mostrar_alerta(f"⚠ {', '.join(fallos)} no convergió: las iteraciones no se acercan a la solución "
                                 f"con este error/máximo de iteraciones. Revise los datos del circuito.")
-        if len(corridas) == 2:
-            (hj, cj, tj), (hg, cg, tg) = corridas["Jacobi"], corridas["Gauss-Seidel"]
-            if not (cj and cg):
-                txt = "No se puede comparar: al menos un método no convergió."
-            else:
-                ganadores = {("Jacobi" if len(hj) < len(hg) else "Gauss-Seidel") if len(hj) != len(hg) else "Empate",
-                             ("Jacobi" if tj < tg else "Gauss-Seidel")}
-                txt = (f"Más eficiente: {ganadores.pop()} (menos iteraciones y menor tiempo)" if len(ganadores) == 1
-                       else "Resultado mixto: un método usó menos iteraciones y el otro menos tiempo.")
-            self.veredicto.configure(text=txt)
-        else:
-            self.veredicto.configure(text="Ejecute el modo «Ambos» para comparar los métodos.")
+        self.veredicto.configure(text=solve.veredicto(corridas) if len(corridas) == 2
+                                 else "Ejecute el modo «Ambos» para comparar los métodos.")
         self.tabs.set("Resumen")
         self._set_status("Circuito resuelto")
 
