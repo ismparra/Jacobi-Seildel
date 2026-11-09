@@ -1,34 +1,117 @@
-"""Interfaz gráfica para resolver sistemas A·x = b con Jacobi y Gauss-Seidel.
+"""Interfaz para resolver circuitos por el método de mallas de Kirchhoff.
 
-Solo interfaz: los botones aún no ejecutan la lógica numérica.
+El usuario captura fuentes y resistencias; se genera el sistema A·I = V
+(ley de voltajes de Kirchhoff) y se resuelve con Jacobi y/o Gauss-Seidel.
 """
 
+import re
+import time
 import tkinter as tk
 from tkinter import ttk
 
 import customtkinter as ctk
 
-ctk.set_appearance_mode("dark")
-ctk.set_default_color_theme("blue")
-
-COLOR_JACOBI = "#3B8ED0"
-COLOR_SEIDEL = "#2FA572"
+# Paleta Kirchhoff: azul de plano eléctrico, ámbar (corriente) y cian (voltaje)
+COLOR_JACOBI = "#F2A900"
+COLOR_SEIDEL = "#22C7D6"
 COLOR_ERROR = "#E5534B"
-COLOR_WARN = "#E3B341"
+COLOR_WARN = "#F2A900"
+BG = ("#EAF1F8", "#0A1724")
+PANEL = ("#DCE7F2", "#112437")
+ACCENT = ("#C98A00", "#F2A900")
+ACCENT_HOVER = ("#A87100", "#FFC233")
+
+ctk.set_appearance_mode("dark")
+ctk.set_default_color_theme("dark-blue")
+for _w, _k in [("CTk", {"fg_color": BG}), ("CTkFrame", {"fg_color": PANEL, "top_fg_color": PANEL}),
+               ("CTkScrollableFrame", {"label_fg_color": PANEL}),
+               ("CTkButton", {"fg_color": ACCENT, "hover_color": ACCENT_HOVER, "text_color": ("white", "#0A1724")}),
+               ("CTkSegmentedButton", {"selected_color": ACCENT, "selected_hover_color": ACCENT_HOVER,
+                                       "text_color": ("white", "#0A1724")}),
+               ("CTkSwitch", {"progress_color": ACCENT}),
+               ("CTkEntry", {"border_color": ("#7FA1C2", "#2A4A6B"), "fg_color": ("#FFFFFF", "#0A1724")})]:
+    ctk.ThemeManager.theme[_w].update({a: list(b) if isinstance(b, tuple) else b for a, b in _k.items()})
+
+# Si se pasa de este valor se considera que las iteraciones se alejan de la solución
+LIMITE_DIVERGENCIA = 1e12
+
+
+# ------------------------------------------------------------------ lógica
+def parsear_suma(texto):
+    """'4 + 3, 2' -> 9.0 (resistencias propias de una malla)."""
+    partes = [p for p in re.split(r"[,+]", texto) if p.strip()]
+    return sum(float(p) for p in partes)
+
+
+def generar_sistema(fuentes, propias, compartidas):
+    """Mallas: R_ii·I_i − Σ R_ij·I_j = V_i. compartidas = [(a, b, R)] con a,b base 0."""
+    n = len(fuentes)
+    A = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        A[i][i] = propias[i]
+    for a, b, r in compartidas:
+        A[a][a] += r
+        A[b][b] += r
+        A[a][b] -= r
+        A[b][a] -= r
+    return A, list(fuentes)
+
+
+def ecuaciones_texto(A, b):
+    eqs = []
+    for i, fila in enumerate(A):
+        t = ""
+        for j, a in enumerate(fila):
+            if a == 0:
+                continue
+            t += f" {'-' if a < 0 else '+'} " if t else ("-" if a < 0 else "")
+            t += f"{abs(a):g}·I{j + 1}"
+        eqs.append(f"Malla {i + 1}:  {t or '0'} = {b[i]:g}")
+    return eqs
+
+
+def es_diagonal_dominante(A):
+    return all(abs(A[i][i]) >= sum(abs(a) for j, a in enumerate(A[i]) if j != i) for i in range(len(A)))
+
+
+def iterar(A, b, x0, tol, max_iter, gauss_seidel):
+    """Devuelve (historial[(k, x, err%)], convergió, tiempo_ms, motivo)."""
+    n = len(b)
+    x = list(x0)
+    hist, motivo, conv = [], "No alcanzó el error permitido en el máximo de iteraciones", False
+    t0 = time.perf_counter()
+    for k in range(1, max_iter + 1):
+        prev = list(x)
+        nuevo = x if gauss_seidel else [0.0] * n  # Seidel sobrescribe x; Jacobi lee solo prev
+        for i in range(n):
+            s = sum(A[i][j] * (nuevo if gauss_seidel else prev)[j] for j in range(n) if j != i)
+            nuevo[i] = (b[i] - s) / A[i][i]
+        x = nuevo
+        err = max(abs(x[i] - prev[i]) / abs(x[i]) * 100 if x[i] else abs(x[i] - prev[i]) * 100
+                  for i in range(n))
+        hist.append((k, list(x), err))
+        if err > LIMITE_DIVERGENCIA or err != err:
+            motivo = "Las iteraciones se alejan de la solución (diverge)"
+            break
+        if err < tol:
+            conv, motivo = True, "Convergió"
+            break
+    return hist, conv, (time.perf_counter() - t0) * 1000, motivo
 
 
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("Jacobi y Gauss-Seidel · Sistemas de ecuaciones lineales")
+        self.title("Leyes de Kirchhoff · Método de mallas con Jacobi y Gauss-Seidel")
         self.geometry("1280x780")
         self.minsize(1100, 700)
         # CustomTkinter reajusta la ventana al iniciar; maximizar tras el primer ciclo
         self.after(0, lambda: self.state("zoomed"))
 
-        self.equation_rows = []  # lista de CTkEntry, una por ecuación
+        self.mesh_rows = []  # (frame, entrada V, entrada R propia)
+        self.shared_rows = []  # (frame, malla a, malla b, entrada R)
 
-        self.grid_columnconfigure(0, weight=0, minsize=430)
+        self.grid_columnconfigure(0, weight=0, minsize=470)
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(1, weight=1)
 
@@ -42,16 +125,17 @@ class App(ctk.CTk):
 
     # ------------------------------------------------------------------ UI
     def _build_header(self):
-        header = ctk.CTkFrame(self, corner_radius=0, fg_color=("gray85", "gray14"))
+        header = ctk.CTkFrame(self, corner_radius=0, fg_color=("#C9DAEA", "#0D1E31"))
         header.grid(row=0, column=0, columnspan=2, sticky="ew")
         ctk.CTkLabel(
             header,
-            text="Solución de sistemas de ecuaciones lineales",
+            text="⚡ Análisis de circuitos · Leyes de Kirchhoff",
             font=ctk.CTkFont(size=22, weight="bold"),
+            text_color=ACCENT,
         ).pack(side="left", padx=20, pady=(12, 0))
         ctk.CTkLabel(
             header,
-            text="Métodos de Jacobi y Gauss-Seidel",
+            text="Método de mallas resuelto con Jacobi y Gauss-Seidel",
             font=ctk.CTkFont(size=13),
             text_color="gray60",
         ).pack(side="left", padx=10, pady=(16, 0))
@@ -66,7 +150,7 @@ class App(ctk.CTk):
         ctk.CTkFrame(header, height=10, fg_color="transparent").pack(side="bottom")
 
     def _build_input_panel(self):
-        panel = ctk.CTkScrollableFrame(self, label_text="Datos del problema")
+        panel = ctk.CTkScrollableFrame(self, label_text="Datos del circuito")
         panel.grid(row=1, column=0, sticky="nsew", padx=(16, 8), pady=12)
         panel.grid_columnconfigure(0, weight=1)
         self.input_panel = panel
@@ -99,38 +183,52 @@ class App(ctk.CTk):
         self.max_iter_entry.grid(row=1, column=1, sticky="ew", padx=(10, 0), pady=(2, 8))
 
         ctk.CTkLabel(
-            params, text="Aproximación inicial (separada por comas)"
+            params, text="Corrientes de malla iniciales, A (separadas por comas)"
         ).grid(row=2, column=0, columnspan=2, sticky="w")
         self.x0_entry = ctk.CTkEntry(params, placeholder_text="0, 0, 0")
         self.x0_entry.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(2, 0))
 
-        # --- Ecuaciones
-        self._section_label(panel, "3. Ecuaciones")
+        # --- Mallas
+        self._section_label(panel, "3. Mallas (corriente en sentido horario)")
         ctk.CTkLabel(
             panel,
-            text="Ejemplo: 4x + y - z = 7   (solo ecuaciones lineales)",
+            text="Voltaje: + si la fuente impulsa la corriente en sentido horario.\n"
+            "R propias: resistencias que solo pertenecen a esa malla (ej. 4 + 3).",
             font=ctk.CTkFont(size=11),
             text_color="gray60",
             anchor="w",
+            justify="left",
         ).pack(fill="x", padx=8)
 
-        self.equations_frame = ctk.CTkFrame(panel, fg_color="transparent")
-        self.equations_frame.pack(fill="x", padx=8, pady=(6, 6))
-        self.equations_frame.grid_columnconfigure(1, weight=1)
+        self.meshes_frame = ctk.CTkFrame(panel, fg_color="transparent")
+        self.meshes_frame.pack(fill="x", padx=8, pady=(6, 6))
+        self.meshes_frame.grid_columnconfigure((1, 2), weight=1)
+        ctk.CTkLabel(self.meshes_frame, text="Voltaje (V)", text_color="gray60").grid(row=0, column=1, sticky="w")
+        ctk.CTkLabel(self.meshes_frame, text="R propias (Ω)", text_color="gray60").grid(
+            row=0, column=2, sticky="w", padx=(6, 0))
+        self.meshes_head = self.meshes_frame.winfo_children()
+
+        # --- Resistencias compartidas
+        self._section_label(panel, "4. Resistencias compartidas entre mallas")
+        self.shared_frame = ctk.CTkFrame(panel, fg_color="transparent")
+        self.shared_frame.pack(fill="x", padx=8, pady=(0, 6))
+        self.shared_frame.grid_columnconfigure((0, 1, 2), weight=1)
 
         tools = ctk.CTkFrame(panel, fg_color="transparent")
         tools.pack(fill="x", padx=8, pady=(0, 14))
         tools.grid_columnconfigure((0, 1), weight=1)
+        ctk.CTkButton(tools, text="＋ Agregar malla", command=self.agregar_malla).grid(
+            row=0, column=0, sticky="ew", padx=(0, 5), pady=(0, 8))
         ctk.CTkButton(
-            tools, text="＋ Agregar ecuación", command=self.agregar_ecuacion
-        ).grid(row=0, column=0, sticky="ew", padx=(0, 5), pady=(0, 8))
-        ctk.CTkButton(
-            tools,
-            text="－ Quitar última",
-            fg_color="gray40",
-            hover_color="gray30",
-            command=self.quitar_ecuacion,
+            tools, text="－ Quitar malla", fg_color="gray40", hover_color="gray30",
+            text_color="white", command=self.quitar_malla,
         ).grid(row=0, column=1, sticky="ew", padx=(5, 0), pady=(0, 8))
+        ctk.CTkButton(tools, text="＋ Agregar compartida", command=self.agregar_compartida).grid(
+            row=1, column=0, sticky="ew", padx=(0, 5), pady=(0, 8))
+        ctk.CTkButton(
+            tools, text="－ Quitar compartida", fg_color="gray40", hover_color="gray30",
+            text_color="white", command=self.quitar_compartida,
+        ).grid(row=1, column=1, sticky="ew", padx=(5, 0), pady=(0, 8))
         ctk.CTkButton(
             tools,
             text="Cargar ejemplo",
@@ -138,7 +236,7 @@ class App(ctk.CTk):
             border_width=2,
             text_color=("gray10", "gray90"),
             command=self.cargar_ejemplo,
-        ).grid(row=1, column=0, sticky="ew", padx=(0, 5))
+        ).grid(row=2, column=0, sticky="ew", padx=(0, 5))
         ctk.CTkButton(
             tools,
             text="Limpiar",
@@ -148,12 +246,12 @@ class App(ctk.CTk):
             text_color=COLOR_ERROR,
             hover_color=("gray80", "gray25"),
             command=self.limpiar,
-        ).grid(row=1, column=1, sticky="ew", padx=(5, 0))
+        ).grid(row=2, column=1, sticky="ew", padx=(5, 0))
 
         # --- Resolver
         self.resolver_btn = ctk.CTkButton(
             panel,
-            text="▶  Resolver",
+            text="▶  Resolver circuito",
             height=44,
             font=ctk.CTkFont(size=16, weight="bold"),
             command=self.resolver,
@@ -170,7 +268,7 @@ class App(ctk.CTk):
             panel, text="Resultados", font=ctk.CTkFont(size=16, weight="bold")
         ).grid(row=0, column=0, sticky="w", padx=16, pady=(12, 4))
 
-        # Banner de alertas (linealidad, convergencia, errores)
+        # Banner de alertas (datos inválidos, convergencia)
         self.alert_banner = ctk.CTkLabel(
             panel,
             text="",
@@ -182,15 +280,26 @@ class App(ctk.CTk):
         )
         self.alert_banner.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 6))
 
-        self.tabs = ctk.CTkTabview(panel)
+        self.tabs = ctk.CTkTabview(
+            panel, segmented_button_selected_color=ACCENT,
+            segmented_button_selected_hover_color=ACCENT_HOVER,
+            segmented_button_unselected_color=("#B8CCE0", "#1B3550"),
+        )
         self.tabs.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 12))
-        for name in ("Resumen", "Jacobi", "Gauss-Seidel", "Comparación"):
+        for name in ("Sistema generado", "Resumen", "Jacobi", "Gauss-Seidel", "Comparación"):
             self.tabs.add(name)
 
+        self._build_system_tab(self.tabs.tab("Sistema generado"))
         self._build_summary_tab(self.tabs.tab("Resumen"))
         self.jacobi_tree = self._build_iteration_tab(self.tabs.tab("Jacobi"))
         self.seidel_tree = self._build_iteration_tab(self.tabs.tab("Gauss-Seidel"))
         self._build_comparison_tab(self.tabs.tab("Comparación"))
+
+    def _build_system_tab(self, tab):
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(0, weight=1)
+        self.system_box = ctk.CTkTextbox(tab, font=ctk.CTkFont(family="Consolas", size=14), state="disabled")
+        self.system_box.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
 
     def _build_summary_tab(self, tab):
         tab.grid_columnconfigure((0, 1), weight=1)
@@ -219,7 +328,7 @@ class App(ctk.CTk):
             val.pack(side="right")
             labels[key] = val
 
-        ctk.CTkLabel(card, text="Solución", text_color="gray60").grid(
+        ctk.CTkLabel(card, text="Corrientes de malla", text_color="gray60").grid(
             row=5, column=0, sticky="w", padx=16, pady=(12, 2)
         )
         sol = ctk.CTkTextbox(card, height=150, state="disabled")
@@ -233,7 +342,7 @@ class App(ctk.CTk):
         tab.grid_rowconfigure(0, weight=1)
         tree = ttk.Treeview(tab, columns=("it", "x", "err"), show="headings")
         tree.heading("it", text="Iteración")
-        tree.heading("x", text="Vector x")
+        tree.heading("x", text="Corrientes I (A)")
         tree.heading("err", text="Error relativo aprox. (%)")
         tree.column("it", width=90, anchor="center", stretch=False)
         tree.column("x", width=420, anchor="w")
@@ -278,7 +387,7 @@ class App(ctk.CTk):
         ).grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 8))
 
     def _build_status_bar(self):
-        bar = ctk.CTkFrame(self, height=28, corner_radius=0, fg_color=("gray85", "gray14"))
+        bar = ctk.CTkFrame(self, height=28, corner_radius=0, fg_color=("#C9DAEA", "#0D1E31"))
         bar.grid(row=2, column=0, columnspan=2, sticky="ew")
         self.status_label = ctk.CTkLabel(
             bar, text="Listo", font=ctk.CTkFont(size=12), text_color="gray60"
@@ -289,12 +398,13 @@ class App(ctk.CTk):
     @staticmethod
     def _section_label(parent, text):
         ctk.CTkLabel(
-            parent, text=text, font=ctk.CTkFont(size=14, weight="bold"), anchor="w"
+            parent, text=text, font=ctk.CTkFont(size=14, weight="bold"), anchor="w",
+            text_color=ACCENT,
         ).pack(fill="x", padx=8, pady=(10, 4))
 
     def _style_treeviews(self):
         dark = ctk.get_appearance_mode() == "Dark"
-        bg, fg, head = ("#2b2b2b", "#e6e6e6", "#1f538d") if dark else ("#ffffff", "#1a1a1a", "#3b8ed0")
+        bg, fg, head = ("#112437", "#e6eef7", "#1B4A78") if dark else ("#ffffff", "#0A1724", "#2A6FB0")
         style = ttk.Style()
         style.theme_use("clam")
         style.configure(
@@ -305,7 +415,7 @@ class App(ctk.CTk):
             "Treeview.Heading", background=head, foreground="white",
             relief="flat", font=("Segoe UI", 10, "bold"),
         )
-        style.map("Treeview", background=[("selected", "#1f538d")])
+        style.map("Treeview", background=[("selected", "#C98A00")], foreground=[("selected", "#0A1724")])
         style.map("Treeview.Heading", background=[("active", head)])
 
     def _toggle_theme(self):
@@ -324,43 +434,65 @@ class App(ctk.CTk):
     def ocultar_alerta(self):
         self.alert_banner.configure(text="", fg_color="transparent")
 
-    # ---------------------------------------------------- filas de ecuación
-    def agregar_ecuacion(self, texto=""):
-        idx = len(self.equation_rows) + 1
-        ctk.CTkLabel(self.equations_frame, text=f"Ec. {idx}", width=44, anchor="w").grid(
-            row=idx - 1, column=0, pady=3
-        )
-        entry = ctk.CTkEntry(self.equations_frame, placeholder_text="a·x + b·y + c·z = d")
-        entry.grid(row=idx - 1, column=1, sticky="ew", pady=3)
-        if isinstance(texto, str) and texto:
-            entry.insert(0, texto)
-        self.equation_rows.append(entry)
+    # ------------------------------------------------------ filas de captura
+    def agregar_malla(self, v="", r=""):
+        idx = len(self.mesh_rows) + 1
+        frame = ctk.CTkFrame(self.meshes_frame, fg_color="transparent")
+        frame.grid(row=idx, column=0, columnspan=3, sticky="ew")
+        frame.grid_columnconfigure((1, 2), weight=1)
+        ctk.CTkLabel(frame, text=f"Malla {idx}", width=60, anchor="w").grid(row=0, column=0, pady=3)
+        ev = ctk.CTkEntry(frame, placeholder_text="10")
+        ev.grid(row=0, column=1, sticky="ew", pady=3)
+        er = ctk.CTkEntry(frame, placeholder_text="4 + 3")
+        er.grid(row=0, column=2, sticky="ew", padx=(6, 0), pady=3)
+        ev.insert(0, str(v))
+        er.insert(0, str(r))
+        self.mesh_rows.append((frame, ev, er))
 
-    def quitar_ecuacion(self):
-        if not self.equation_rows:
-            return
-        self.equation_rows.pop().destroy()
-        # el último label de la columna 0 también debe eliminarse
-        labels = [w for w in self.equations_frame.grid_slaves(column=0)]
-        if labels:
-            max(labels, key=lambda w: int(w.grid_info()["row"])).destroy()
+    def quitar_malla(self):
+        if self.mesh_rows:
+            self.mesh_rows.pop()[0].destroy()
 
-    # --------------------------------------------- acciones (sin lógica aún)
+    def agregar_compartida(self, a="", b="", r=""):
+        frame = ctk.CTkFrame(self.shared_frame, fg_color="transparent")
+        frame.pack(fill="x")
+        frame.grid_columnconfigure((0, 1, 2), weight=1)
+        ents = []
+        for c, ph in enumerate(("Malla a", "Malla b", "R (Ω)")):
+            e = ctk.CTkEntry(frame, placeholder_text=ph)
+            e.grid(row=0, column=c, sticky="ew", padx=(0 if c == 0 else 6, 0), pady=3)
+            ents.append(e)
+        for e, val in zip(ents, (a, b, r)):
+            e.insert(0, str(val))
+        self.shared_rows.append((frame, *ents))
+
+    def quitar_compartida(self):
+        if self.shared_rows:
+            self.shared_rows.pop()[0].destroy()
+
+    def _escribir(self, box, texto):
+        box.configure(state="normal")
+        box.delete("1.0", "end")
+        box.insert("1.0", texto)
+        box.configure(state="disabled")
+
+    # ----------------------------------------------------------- acciones
     def cargar_ejemplo(self):
         self.limpiar()
-        for eq in ("10x + y + z = 12", "2x + 10y + z = 13", "2x + 2y + 10z = 14"):
-            self.agregar_ecuacion(eq)
+        for v, r in ((20, "4"), (0, "3"), (10, "2")):
+            self.agregar_malla(v, r)
+        for a, b, r in ((1, 2, 5), (2, 3, 4), (1, 3, 2)):
+            self.agregar_compartida(a, b, r)
         self.error_entry.insert(0, "0.001")
         self.max_iter_entry.insert(0, "100")
         self.x0_entry.insert(0, "0, 0, 0")
         self._set_status("Ejemplo cargado")
 
     def limpiar(self):
-        for entry in self.equation_rows:
-            entry.destroy()
-        for w in self.equations_frame.winfo_children():
-            w.destroy()
-        self.equation_rows.clear()
+        while self.mesh_rows:
+            self.quitar_malla()
+        while self.shared_rows:
+            self.quitar_compartida()
         for e in (self.error_entry, self.max_iter_entry, self.x0_entry):
             e.delete(0, "end")
         for tree in (self.jacobi_tree, self.seidel_tree, self.compare_tree):
@@ -368,17 +500,103 @@ class App(ctk.CTk):
         for card in (self.jacobi_card, self.seidel_card):
             for key in ("estado", "iter", "tiempo", "error"):
                 card[key].configure(text="—")
-            card["solucion"].configure(state="normal")
-            card["solucion"].delete("1.0", "end")
-            card["solucion"].configure(state="disabled")
+            self._escribir(card["solucion"], "")
+        self._escribir(self.system_box, "")
         self.veredicto.configure(text="Ejecute el modo «Ambos» para comparar los métodos.")
         self.ocultar_alerta()
         self._set_status("Campos limpiados")
 
-    def resolver(self):
-        # TODO: validar linealidad, parsear A y b, ejecutar métodos y llenar resultados.
-        self._set_status("La lógica de resolución aún no está implementada")
+    def _leer_datos(self):
+        """Valida la captura; lanza ValueError con un mensaje para el usuario."""
+        n = len(self.mesh_rows)
+        if n < 2:
+            raise ValueError("Agregue al menos 2 mallas.")
+        try:
+            fuentes = [float(ev.get()) for _, ev, _ in self.mesh_rows]
+            propias = [parsear_suma(er.get()) for _, _, er in self.mesh_rows]
+            comp = []
+            for _, ea, eb, er in self.shared_rows:
+                a, b, r = int(ea.get()) - 1, int(eb.get()) - 1, float(er.get())
+                if a == b or not (0 <= a < n and 0 <= b < n):
+                    raise ValueError(f"Resistencia compartida inválida: mallas {a + 1} y {b + 1}.")
+                comp.append((a, b, r))
+            tol = float(self.error_entry.get() or 0.001)
+            max_iter = int(self.max_iter_entry.get() or 100)
+            x0 = [float(t) for t in self.x0_entry.get().split(",")] if self.x0_entry.get().strip() else [0.0] * n
+        except ValueError as e:
+            raise ValueError(str(e) if "inválida" in str(e) else "Hay valores no numéricos o vacíos en los datos.")
+        if len(x0) != n:
+            raise ValueError(f"La aproximación inicial debe tener {n} valores (uno por malla).")
+        if any(r <= 0 for r in propias) and not comp or any(r < 0 for _, _, r in comp) or tol <= 0 or max_iter < 1:
+            raise ValueError("Resistencias ≥ 0, error > 0 e iteraciones ≥ 1.")
+        return fuentes, propias, comp, tol, max_iter, x0
 
+    def resolver(self):
+        self.ocultar_alerta()
+        try:
+            fuentes, propias, comp, tol, max_iter, x0 = self._leer_datos()
+        except ValueError as e:
+            self.mostrar_alerta(f"⚠ {e}", COLOR_ERROR)
+            self._set_status("Datos inválidos")
+            return
+        A, b = generar_sistema(fuentes, propias, comp)
+        if any(A[i][i] == 0 for i in range(len(b))):
+            self.mostrar_alerta("⚠ Una malla tiene resistencia total 0 Ω: el sistema no se puede resolver.", COLOR_ERROR)
+            return
+
+        dom = es_diagonal_dominante(A)
+        lineas = ["Ley de voltajes de Kirchhoff (corrientes de malla, sentido horario):", ""]
+        lineas += ecuaciones_texto(A, b)
+        lineas += ["", "Forma matricial  A·I = V:", ""]
+        lineas += ["  [ " + "  ".join(f"{a:8.3g}" for a in fila) + f" ]   [ I{i + 1} ] = [ {b[i]:g} ]"
+                   for i, fila in enumerate(A)]
+        lineas += ["", "Matriz diagonalmente dominante: " + ("sí (convergencia garantizada)" if dom
+                                                          else "no (puede o no converger)")]
+        self._escribir(self.system_box, "\n".join(lineas))
+
+        metodo = self.metodo_var.get()
+        corridas = {}
+        for nombre, gs, tree, card in (("Jacobi", False, self.jacobi_tree, self.jacobi_card),
+                                       ("Gauss-Seidel", True, self.seidel_tree, self.seidel_card)):
+            tree.delete(*tree.get_children())
+            if metodo not in (nombre, "Ambos"):
+                for k in ("estado", "iter", "tiempo", "error"):
+                    card[k].configure(text="—")
+                self._escribir(card["solucion"], "")
+                continue
+            hist, conv, ms, motivo = iterar(A, b, x0, tol, max_iter, gs)
+            corridas[nombre] = (hist, conv, ms)
+            for k, x, err in hist:
+                tree.insert("", "end", values=(k, ",  ".join(f"I{i + 1}={v:.6f}" for i, v in enumerate(x)),
+                                               f"{err:.6f}"))
+            card["estado"].configure(text="✔ Convergió" if conv else "✖ No convergió")
+            card["iter"].configure(text=str(len(hist)))
+            card["tiempo"].configure(text=f"{ms:.3f} ms")
+            card["error"].configure(text=f"{hist[-1][2]:.6g}")
+            self._escribir(card["solucion"], "\n".join(f"I{i + 1} = {v:.6f} A" for i, v in enumerate(hist[-1][1])))
+
+        self.compare_tree.delete(*self.compare_tree.get_children())
+        for nombre, (hist, conv, ms) in corridas.items():
+            self.compare_tree.insert("", "end", values=(nombre, len(hist), f"{ms:.3f}", f"{hist[-1][2]:.6g}",
+                                                        "Sí" if conv else "No"))
+        fallos = [n for n, (_, c, _) in corridas.items() if not c]
+        if fallos:
+            self.mostrar_alerta(f"⚠ {', '.join(fallos)} no convergió: las iteraciones no se acercan a la solución "
+                                f"con este error/máximo de iteraciones. Revise los datos del circuito.")
+        if len(corridas) == 2:
+            (hj, cj, tj), (hg, cg, tg) = corridas["Jacobi"], corridas["Gauss-Seidel"]
+            if not (cj and cg):
+                txt = "No se puede comparar: al menos un método no convergió."
+            else:
+                ganadores = {("Jacobi" if len(hj) < len(hg) else "Gauss-Seidel") if len(hj) != len(hg) else "Empate",
+                             ("Jacobi" if tj < tg else "Gauss-Seidel")}
+                txt = (f"Más eficiente: {ganadores.pop()} (menos iteraciones y menor tiempo)" if len(ganadores) == 1
+                       else "Resultado mixto: un método usó menos iteraciones y el otro menos tiempo.")
+            self.veredicto.configure(text=txt)
+        else:
+            self.veredicto.configure(text="Ejecute el modo «Ambos» para comparar los métodos.")
+        self.tabs.set("Resumen")
+        self._set_status("Circuito resuelto")
 
 
 if __name__ == "__main__":
